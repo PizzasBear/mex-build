@@ -1,5 +1,22 @@
 use std::{fmt, ops, path::PathBuf, str};
 
+pub trait Spanned {
+    #[must_use]
+    fn span(&self) -> Span;
+}
+
+impl<T: Spanned> Spanned for &T {
+    fn span(&self) -> Span {
+        T::span(self)
+    }
+}
+
+impl<T: Spanned> Spanned for &mut T {
+    fn span(&self) -> Span {
+        T::span(self)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Pos {
@@ -20,10 +37,6 @@ impl Pos {
         self.offset += s.len() as u32;
     }
 
-    #[must_use]
-    pub fn to_span(self) -> Span {
-        self.to(self)
-    }
     #[must_use]
     pub fn to(self, end: Self) -> Span {
         Span { start: self, end }
@@ -60,6 +73,12 @@ impl Pos {
             line,
             col,
         }
+    }
+}
+
+impl Spanned for Pos {
+    fn span(&self) -> Span {
+        self.to(*self)
     }
 }
 
@@ -100,6 +119,11 @@ impl Span {
         self.start().offset()..self.end().offset()
     }
     #[must_use]
+    pub fn join(&self, other: impl Spanned) -> Self {
+        let other = other.span();
+        (self.start().min(other.start())).to(self.end().max(other.end()))
+    }
+    #[must_use]
     pub fn display<'a>(&self, source: &'a Source) -> SpanDisplay<'a> {
         let (line, col) = self.start().line_col(source);
         SpanDisplay {
@@ -108,6 +132,12 @@ impl Span {
             line,
             col,
         }
+    }
+}
+
+impl Spanned for Span {
+    fn span(&self) -> Span {
+        *self
     }
 }
 
@@ -150,11 +180,6 @@ impl fmt::Display for SpanDisplay<'_> {
     }
 }
 
-pub trait Spanned {
-    #[must_use]
-    fn span(&self) -> Span;
-}
-
 #[derive(Clone)]
 pub struct PosDisplay<'a> {
     source: &'a Source,
@@ -188,9 +213,16 @@ pub struct Source {
     pub code: String,
 }
 
+impl Source {
+    #[must_use]
+    pub fn snippet<T: Clone>(&self) -> annotate_snippets::Snippet<'_, T> {
+        annotate_snippets::Snippet::source(self.code.as_str()).path(self.path.to_string_lossy())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodeIter<'a> {
-    _source: &'a Source,
+    source: &'a Source,
     pos: Pos,
     chars: str::Chars<'a>,
 }
@@ -202,10 +234,14 @@ impl<'a> CodeIter<'a> {
         assert!(source.code.len() <= u32::MAX as usize);
 
         Self {
-            _source: source,
+            source,
             pos: Pos { offset: 0 },
             chars: source.code.chars(),
         }
+    }
+    #[must_use]
+    pub fn source(&self) -> &'a Source {
+        &self.source
     }
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -218,10 +254,6 @@ impl<'a> CodeIter<'a> {
     #[must_use]
     pub fn as_str(&self) -> &'a str {
         self.chars.as_str()
-    }
-    #[must_use]
-    pub fn as_bytes(&self) -> &'a [u8] {
-        self.as_str().as_bytes()
     }
     #[must_use]
     pub fn pos(&self) -> Pos {
@@ -253,7 +285,7 @@ impl<'a> CodeIter<'a> {
         }
         (start.up_to(self), start.as_str_until(self.pos()))
     }
-    pub fn take_str_if_matches(&mut self, s: &str) -> Option<Span> {
+    pub fn take_str_matches(&mut self, s: &str) -> Option<Span> {
         let start = self.clone();
         self.as_str().starts_with(s).then(|| {
             self.skip_n_bytes(s.len());
@@ -296,5 +328,11 @@ impl<'a> CodeIter<'a> {
     #[inline]
     pub fn speculate(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
         self.speculate_map(|peek| f(peek).then_some(())).is_some()
+    }
+}
+
+impl Spanned for CodeIter<'_> {
+    fn span(&self) -> Span {
+        self.pos().span()
     }
 }
