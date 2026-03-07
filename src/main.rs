@@ -293,25 +293,15 @@ impl fmt::Display for Filler<'_> {
 }
 
 impl Filler<'_> {
+    const EMPTY: Self = Self {
+        start_newlines: 0,
+        comments: vec![],
+    };
+
     #[inline]
     #[must_use]
     fn is_empty(&self) -> bool {
         self.start_newlines == 0 && self.comments.len() == 0
-    }
-}
-
-#[derive(Debug)]
-enum FillerOr<'a, T: 'a> {
-    Value(T),
-    Filler(Filler<'a>),
-}
-
-impl<T: fmt::Display> fmt::Display for FillerOr<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Value(val) => fmt::Display::fmt(val, f),
-            Self::Filler(filler) => fmt::Display::fmt(filler, f),
-        }
     }
 }
 
@@ -413,7 +403,7 @@ impl fmt::Display for Binding<'_> {
 struct RuleStmt<'a> {
     rule_span: Span,
     name: Varname<'a>,
-    bindings: Vec<FillerOr<'a, Binding<'a>>>,
+    bindings: Vec<(Filler<'a>, Binding<'a>)>,
 }
 
 impl fmt::Display for RuleStmt<'_> {
@@ -421,7 +411,8 @@ impl fmt::Display for RuleStmt<'_> {
         f.write_str("rule ")?;
         fmt::Display::fmt(&self.name, f)?;
         f.write_str("\n")?;
-        for binding in &self.bindings {
+        for (filler, binding) in &self.bindings {
+            fmt::Display::fmt(filler, f)?;
             fmt::Display::fmt(binding, f)?;
         }
         Ok(())
@@ -446,7 +437,7 @@ fn parse_rule<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
     rule_span: Span,
-) -> RuleStmt<'a> {
+) -> (RuleStmt<'a>, Filler<'a>) {
     eat_whitespace(code, Some(errors));
     let name = parse_varname(code, false).unwrap_or_else(|| {
         errors.push(new_parse_error(
@@ -465,16 +456,12 @@ fn parse_rule<'a>(
     }
 
     let mut bindings = vec![];
-
-    loop {
+    let filler = loop {
         let filler = parse_filler(code, errors);
-        if !filler.is_empty() {
-            bindings.push(FillerOr::Filler(filler));
-        }
 
         let indent_span = eat_whitespace(code, Some(errors));
         if indent_span.is_empty() {
-            break;
+            break filler;
         }
 
         let let_stmt = parse_let(code, errors);
@@ -498,17 +485,20 @@ fn parse_rule<'a>(
                     ),
             );
         }
-        bindings.push(FillerOr::Value(Binding {
+        let binding = Binding {
             indent_span,
             let_stmt,
-        }));
-    }
+        };
+        bindings.push((filler, binding));
+    };
 
-    RuleStmt {
+    let rule_stmt = RuleStmt {
         rule_span,
         name,
         bindings,
-    }
+    };
+
+    (rule_stmt, filler)
 }
 
 #[derive(Debug)]
@@ -521,7 +511,7 @@ struct BuildStmt<'a> {
     implicit_deps: Vec<EvalString<'a>>,
     order_only_deps: Vec<EvalString<'a>>,
     validations: Vec<EvalString<'a>>,
-    bindings: Vec<FillerOr<'a, Binding<'a>>>,
+    bindings: Vec<(Filler<'a>, Binding<'a>)>,
 }
 
 impl fmt::Display for BuildStmt<'_> {
@@ -566,7 +556,8 @@ impl fmt::Display for BuildStmt<'_> {
             fmt::Display::fmt(val, f)?;
         }
         f.write_str("\n")?;
-        for binding in &self.bindings {
+        for (filler, binding) in &self.bindings {
+            fmt::Display::fmt(filler, f)?;
             fmt::Display::fmt(binding, f)?;
         }
         Ok(())
@@ -577,7 +568,7 @@ fn parse_build<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
     build_span: Span,
-) -> BuildStmt<'a> {
+) -> (BuildStmt<'a>, Filler<'a>) {
     let outs = parse_paths(code, errors);
     let implicit_outs = match code.take_char_matches('|') {
         true => parse_paths(code, errors),
@@ -630,25 +621,23 @@ fn parse_build<'a>(
 
     let mut bindings = vec![];
 
-    loop {
+    let filler = loop {
         let filler = parse_filler(code, errors);
-        if !filler.is_empty() {
-            bindings.push(FillerOr::Filler(filler));
-        }
 
         let indent_span = eat_whitespace(code, Some(errors));
         if indent_span.is_empty() {
-            break;
+            break filler;
         }
 
         let let_stmt = parse_let(code, errors);
-        bindings.push(FillerOr::Value(Binding {
+        let binding = Binding {
             indent_span,
             let_stmt,
-        }));
-    }
+        };
+        bindings.push((filler, binding));
+    };
 
-    BuildStmt {
+    let build_stmt = BuildStmt {
         build_span,
         outs,
         implicit_outs,
@@ -658,7 +647,9 @@ fn parse_build<'a>(
         order_only_deps,
         validations,
         bindings,
-    }
+    };
+
+    (build_stmt, filler)
 }
 
 #[derive(Debug)]
@@ -704,7 +695,7 @@ fn parse_default<'a>(
 struct PoolStmt<'a> {
     pool_span: Span,
     name: Varname<'a>,
-    bindings: Vec<FillerOr<'a, Binding<'a>>>,
+    bindings: Vec<(Filler<'a>, Binding<'a>)>,
 }
 
 impl fmt::Display for PoolStmt<'_> {
@@ -712,7 +703,8 @@ impl fmt::Display for PoolStmt<'_> {
         f.write_str("pool ")?;
         fmt::Display::fmt(&self.name, f)?;
         f.write_str("\n")?;
-        for binding in &self.bindings {
+        for (filler, binding) in &self.bindings {
+            fmt::Display::fmt(filler, f)?;
             fmt::Display::fmt(binding, f)?;
         }
         Ok(())
@@ -723,7 +715,7 @@ fn parse_pool<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
     pool_span: Span,
-) -> PoolStmt<'a> {
+) -> (PoolStmt<'a>, Filler<'a>) {
     eat_whitespace(code, Some(errors));
     let name = parse_varname(code, false).unwrap_or_else(|| {
         errors.push(new_parse_error(
@@ -745,15 +737,12 @@ fn parse_pool<'a>(
     let mut bindings = vec![];
 
     let mut depth_defined = false;
-    loop {
+    let filler = loop {
         let filler = parse_filler(code, errors);
-        if !filler.is_empty() {
-            bindings.push(FillerOr::Filler(filler));
-        }
 
         let indent_span = eat_whitespace(code, Some(errors));
         if indent_span.is_empty() {
-            break;
+            break filler;
         }
 
         let let_stmt = parse_let(code, errors);
@@ -778,12 +767,13 @@ fn parse_pool<'a>(
             );
         } else {
             depth_defined = true;
-            bindings.push(FillerOr::Value(Binding {
+            let binding = Binding {
                 indent_span,
                 let_stmt,
-            }));
+            };
+            bindings.push((filler, binding));
         }
-    }
+    };
 
     if !depth_defined {
         errors.push(
@@ -806,11 +796,13 @@ fn parse_pool<'a>(
         );
     }
 
-    PoolStmt {
+    let pool_stmt = PoolStmt {
         pool_span,
         name,
         bindings,
-    }
+    };
+
+    (pool_stmt, filler)
 }
 
 #[derive(Debug)]
@@ -836,13 +828,11 @@ impl fmt::Display for Item<'_> {
     }
 }
 
-fn parse_item<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> Item<'a> {
+fn parse_item<'a>(
+    code: &mut CodeIter<'a>,
+    errors: &mut Vec<ParseError<'a>>,
+) -> (Item<'a>, Filler<'a>) {
     loop {
-        let filler = parse_filler(code, errors);
-        if !filler.is_empty() {
-            return Item::Filler(filler);
-        }
-
         let indent_span = eat_whitespace(code, Some(errors));
 
         if !indent_span.is_empty() {
@@ -855,15 +845,20 @@ fn parse_item<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> 
         }
 
         if let Some(rule_span) = code.take_str_matches("rule") {
-            break Item::Rule(parse_rule(code, errors, rule_span));
+            let (rule_stmt, filler) = parse_rule(code, errors, rule_span);
+            break (Item::Rule(rule_stmt), filler);
         } else if let Some(build_span) = code.take_str_matches("build") {
-            break Item::Build(parse_build(code, errors, build_span));
+            let (build_stmt, filler) = parse_build(code, errors, build_span);
+            break (Item::Build(build_stmt), filler);
         } else if let Some(default_stmt) = code.take_str_matches("default") {
-            break Item::Default(parse_default(code, errors, default_stmt));
-        } else if let Some(pool_stmt) = code.take_str_matches("pool") {
-            break Item::Pool(parse_pool(code, errors, pool_stmt));
+            let default_stmt = parse_default(code, errors, default_stmt);
+            break (Item::Default(default_stmt), parse_filler(code, errors));
+        } else if let Some(pool_span) = code.take_str_matches("pool") {
+            let (pool_stmt, filler) = parse_pool(code, errors, pool_span);
+            break (Item::Pool(pool_stmt), filler);
         } else {
-            break Item::Let(parse_let(code, errors));
+            let let_stmt = parse_let(code, errors);
+            break (Item::Let(let_stmt), parse_filler(code, errors));
         }
     }
 }
@@ -883,11 +878,21 @@ impl fmt::Display for MexFile<'_> {
 }
 
 fn parse_file<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> MexFile<'a> {
-    let mut stmts = vec![];
-    while !code.is_empty() {
-        stmts.push(parse_item(code, errors));
+    let mut items = vec![];
+
+    let filler = parse_filler(code, errors);
+    if !filler.is_empty() {
+        items.push(Item::Filler(filler));
     }
-    MexFile { items: stmts }
+
+    while !code.is_empty() {
+        let (item, filler) = parse_item(code, errors);
+        items.push(item);
+        if !filler.is_empty() {
+            items.push(Item::Filler(filler));
+        }
+    }
+    MexFile { items }
 }
 
 #[derive(clap::Parser, Debug)]
