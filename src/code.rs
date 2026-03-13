@@ -49,31 +49,6 @@ impl Pos {
     pub fn offset(&self) -> usize {
         self.offset as _
     }
-
-    #[must_use]
-    pub fn line_col(&self, source: &Source) -> (u32, u32) {
-        let code_before = &source.code[..self.offset()];
-        let line_start = code_before.rfind('\n').map_or(0, |i| i + 1);
-
-        let line = 1 + code_before[..line_start]
-            .bytes()
-            .map(|b| (b == b'\n') as u32)
-            .sum::<u32>();
-        let col = (self.offset() - line_start + 1) as _;
-        (line, col)
-    }
-
-    #[must_use]
-    pub fn display<'a>(&self, source: &'a Source) -> PosDisplay<'a> {
-        let (line, col) = self.line_col(source);
-
-        PosDisplay {
-            source,
-            pos: *self,
-            line,
-            col,
-        }
-    }
 }
 
 impl Spanned for Pos {
@@ -123,87 +98,11 @@ impl Span {
         let other = other.span();
         (self.start().min(other.start())).to(self.end().max(other.end()))
     }
-    #[must_use]
-    pub fn display<'a>(&self, source: &'a Source) -> SpanDisplay<'a> {
-        let (line, col) = self.start().line_col(source);
-        SpanDisplay {
-            source,
-            span: *self,
-            line,
-            col,
-        }
-    }
 }
 
 impl Spanned for Span {
     fn span(&self) -> Span {
         *self
-    }
-}
-
-#[must_use]
-#[derive(Clone)]
-pub struct SpanDisplay<'a> {
-    source: &'a Source,
-    span: Span,
-    line: u32,
-    col: u32,
-}
-
-impl fmt::Display for SpanDisplay<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write;
-
-        let line_start = (self.span.start.offset + 1 - self.col) as usize;
-        writeln!(
-            f,
-            "At {}:{}:{}",
-            self.source.path.display(),
-            self.line,
-            self.col
-        )?;
-        let mut index = line_start;
-
-        let end = self.span.end();
-        for line in self.source.code[line_start..].split('\n') {
-            f.write_str("> ")?;
-            f.write_str(line.trim_ascii_end())?;
-            f.write_char('\n')?;
-
-            index += line.len() + 1;
-            if end.offset() <= index {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct PosDisplay<'a> {
-    source: &'a Source,
-    pos: Pos,
-    line: u32,
-    col: u32,
-}
-
-impl fmt::Display for PosDisplay<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write;
-
-        let line_start = (self.pos.offset + 1 - self.col) as usize;
-        write!(
-            f,
-            "At {}:{}:{}\n> ",
-            self.source.path.display(),
-            self.line,
-            self.col
-        )?;
-        f.write_str(self.source.code[line_start..].lines().next().unwrap_or(""))?;
-        f.write_char('\n')?;
-
-        Ok(())
     }
 }
 
