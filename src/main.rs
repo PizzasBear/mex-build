@@ -6,6 +6,7 @@ use std::{borrow::Cow, fmt, fs, path::PathBuf};
 use crate::code::{CodeIter, Source, Span, Spanned};
 
 mod code;
+mod list;
 
 type ParseError<'a> = annotate_snippets::Group<'a>;
 
@@ -113,16 +114,41 @@ fn parse_varname<'a>(code: &mut CodeIter<'a>, simple: bool) -> Option<Varname<'a
 enum EvalStringPiece<'a> {
     Literal(&'a str),
     Var(Varname<'a>),
+    QuoteVar(Varname<'a>),
+    Func(EvalString<'a>),
+    QuoteFunc(EvalString<'a>),
 }
 
 impl fmt::Display for EvalStringPiece<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // $"(run $python script.py)"
         match self {
+            Self::Literal("$") => f.write_str("$$"),
+            Self::Literal("|") => f.write_str("$|"),
+            Self::Literal(":") => f.write_str("$:"),
             Self::Literal(lit) => f.write_str(lit),
             Self::Var(var) => {
                 f.write_str("${")?;
                 fmt::Display::fmt(var, f)?;
                 f.write_str("}")?;
+                Ok(())
+            }
+            Self::QuoteVar(var) => {
+                f.write_str("$\"")?;
+                fmt::Display::fmt(var, f)?;
+                f.write_str("\"")?;
+                Ok(())
+            }
+            Self::Func(func) => {
+                f.write_str("$(")?;
+                fmt::Display::fmt(func, f)?;
+                f.write_str(")")?;
+                Ok(())
+            }
+            Self::QuoteFunc(func) => {
+                f.write_str("$\"(")?;
+                fmt::Display::fmt(func, f)?;
+                f.write_str(")\"")?;
                 Ok(())
             }
         }
@@ -144,29 +170,38 @@ impl fmt::Display for EvalString<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalStrNewline {
+    Ignore,
+    Stop,
+    Consume,
+}
+
 fn parse_eval_str<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
-    path: bool,
+    stop_chars: &[char],
+    newline_handling: EvalStrNewline,
 ) -> EvalString<'a> {
     let start = code.pos();
 
     let mut pieces = vec![];
     loop {
-        let (_, lit) = code.take_char_while(|ch| {
-            !matches!(ch, '\r' | '\n' | '$') && !(path && matches!(ch, ' ' | ':' | '|'))
-        });
+        let (_, lit) = code
+            .take_char_while(|ch| !matches!(ch, '\r' | '\n' | '$') && !stop_chars.contains(&ch));
         if !lit.is_empty() {
             pieces.push(EvalStringPiece::Literal(lit))
         }
 
         let piece_start = code.clone();
         if code.take_newline() {
-            if path {
-                *code = piece_start;
+            match newline_handling {
+                EvalStrNewline::Ignore => pieces.push(EvalStringPiece::Literal("\n")),
+                EvalStrNewline::Stop => *code = piece_start,
+                EvalStrNewline::Consume => {}
             }
             break;
-        } else if path && matches!(code.peek(), Some(' ' | ':' | '|')) {
+        } else if code.peek().is_some_and(|ch| stop_chars.contains(&ch)) {
             break;
         } else if code.take_char_matches('$') {
             if code.take_char_matches('$') {
@@ -199,6 +234,26 @@ fn parse_eval_str<'a>(
             } else if code.take_char_matches('^') {
                 // Starting with the yet unreleased, ninja 1.14
                 pieces.push(EvalStringPiece::Literal("\n"));
+            } else if code.take_char_matches('"') {
+                // MEX extension
+                let name = parse_varname(code, false).unwrap_or_else(|| {
+                    errors.push(new_parse_error(
+                        code,
+                        "expected a variable name",
+                        &*code,
+                        "here",
+                    ));
+                    Varname::new_invalid_at(code)
+                });
+                pieces.push(EvalStringPiece::QuoteVar(name));
+                if !code.take_char_matches('"') {
+                    errors.push(new_parse_error(
+                        code,
+                        "expected a closing double quote (\")",
+                        &*code,
+                        "here",
+                    ));
+                }
             } else if let Some(name) = parse_varname(code, true) {
                 pieces.push(EvalStringPiece::Var(name));
             } else {
@@ -218,17 +273,13 @@ fn parse_eval_str<'a>(
                 "here",
             ));
         } else if code.is_empty() {
-            if !path {
+            if matches!(newline_handling, EvalStrNewline::Consume) {
                 errors.push(new_parse_error(code, "unexpected EOF", &*code, "here"));
             }
             break;
         } else {
             unreachable!();
         }
-    }
-
-    if path {
-        eat_whitespace(code, Some(errors));
     }
 
     EvalString {
@@ -245,7 +296,8 @@ fn parse_paths<'a>(
     eat_whitespace(code, Some(errors));
     let start = code.clone();
     loop {
-        let path = parse_eval_str(code, errors, true);
+        let path = parse_eval_str(code, errors, &[' ', ':', '|'], EvalStrNewline::Stop);
+        eat_whitespace(code, Some(errors));
         if path.pieces.is_empty() {
             break;
         }
@@ -293,11 +345,6 @@ impl fmt::Display for Filler<'_> {
 }
 
 impl Filler<'_> {
-    const EMPTY: Self = Self {
-        start_newlines: 0,
-        comments: vec![],
-    };
-
     #[inline]
     #[must_use]
     fn is_empty(&self) -> bool {
@@ -351,7 +398,9 @@ struct LetStmt<'a> {
 impl fmt::Display for LetStmt<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.var, f)?;
-        f.write_str(" = ")?;
+        if !matches!(self.var.name, "@" | "!") {
+            f.write_str(" = ")?;
+        }
         fmt::Display::fmt(&self.value, f)?;
         f.write_str("\n")?;
         Ok(())
@@ -378,7 +427,7 @@ fn parse_let<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> L
         ));
     }
     eat_whitespace(code, None);
-    let value = parse_eval_str(code, errors, false);
+    let value = parse_eval_str(code, errors, &[], EvalStrNewline::Consume);
 
     LetStmt { var, value }
 }
@@ -464,32 +513,47 @@ fn parse_rule<'a>(
             break filler;
         }
 
-        let let_stmt = parse_let(code, errors);
-        if !is_reserved_binding(&let_stmt.var.name) && let_stmt.var.is_valid() {
-            errors.push(
-                annotate_snippets::Level::ERROR
-                    .primary_title(format!("unexpected variable '{}'", let_stmt.var))
-                    .element(
-                        code.source().snippet().annotations([
-                            annotate_snippets::AnnotationKind::Context
-                                .span(rule_span.join(name.span()).to_range())
-                                .label("while parsing"),
-                            annotate_snippets::AnnotationKind::Primary
-                                .span(let_stmt.var.span().to_range())
-                                .label("here"),
-                        ]),
-                    )
-                    .element(
-                        annotate_snippets::Level::INFO
-                            .message("rules may only bind certain variables"),
-                    ),
-            );
+        let name_start = code.clone();
+        if code.take_char_if(|ch| matches!(ch, '@' | '!')).is_some() {
+            // MEX extension
+            let var = Varname {
+                span: name_start.up_to(code),
+                name: name_start.as_str_until(code.pos()),
+            };
+            let value = parse_eval_str(code, errors, &[], EvalStrNewline::Consume);
+            let binding = Binding {
+                indent_span,
+                let_stmt: LetStmt { var, value },
+            };
+            bindings.push((filler, binding))
+        } else {
+            let let_stmt = parse_let(code, errors);
+            if !is_reserved_binding(&let_stmt.var.name) && let_stmt.var.is_valid() {
+                errors.push(
+                    annotate_snippets::Level::ERROR
+                        .primary_title(format!("unexpected variable '{}'", let_stmt.var))
+                        .element(
+                            code.source().snippet().annotations([
+                                annotate_snippets::AnnotationKind::Context
+                                    .span(rule_span.join(name.span()).to_range())
+                                    .label("while parsing"),
+                                annotate_snippets::AnnotationKind::Primary
+                                    .span(let_stmt.var.span().to_range())
+                                    .label("here"),
+                            ]),
+                        )
+                        .element(
+                            annotate_snippets::Level::INFO
+                                .message("rules may only bind certain variables"),
+                        ),
+                );
+            }
+            let binding = Binding {
+                indent_span,
+                let_stmt,
+            };
+            bindings.push((filler, binding));
         }
-        let binding = Binding {
-            indent_span,
-            let_stmt,
-        };
-        bindings.push((filler, binding));
     };
 
     let rule_stmt = RuleStmt {
