@@ -5,18 +5,6 @@ pub trait Spanned {
     fn span(&self) -> Span;
 }
 
-impl<T: Spanned> Spanned for &T {
-    fn span(&self) -> Span {
-        T::span(self)
-    }
-}
-
-impl<T: Spanned> Spanned for &mut T {
-    fn span(&self) -> Span {
-        T::span(self)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Pos {
@@ -42,8 +30,8 @@ impl Pos {
         Span { start: self, end }
     }
     #[must_use]
-    pub fn up_to(self, code: &CodeIter) -> Span {
-        self.to(code.pos())
+    pub fn up_to(self, end: &impl Spanned) -> Span {
+        self.to(end.span().start())
     }
     #[must_use]
     pub fn offset(&self) -> usize {
@@ -159,8 +147,8 @@ impl<'a> CodeIter<'a> {
         self.pos
     }
     #[must_use]
-    pub fn up_to(&self, next: &Self) -> Span {
-        self.pos.up_to(next)
+    pub fn up_to(&self, end: &impl Spanned) -> Span {
+        self.pos.up_to(end)
     }
     pub fn next_char(&mut self) -> Option<char> {
         let ch = self.chars.next()?;

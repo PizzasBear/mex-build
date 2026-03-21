@@ -3,16 +3,20 @@ extern crate anyhow;
 
 use std::{borrow::Cow, fmt, fs, path::PathBuf};
 
-use crate::code::{CodeIter, Source, Span, Spanned};
+use crate::{
+    code::{CodeIter, Source, Span, Spanned},
+    list::QuoteMode,
+};
 
 mod code;
+mod list;
 
 type ParseError<'a> = annotate_snippets::Group<'a>;
 
 fn new_parse_error<'a>(
     code: &CodeIter<'a>,
     primary_title: impl Into<Cow<'a, str>>,
-    annotation_span: impl Spanned,
+    annotation_span: &impl Spanned,
     annotation_label: impl Into<annotate_snippets::OptionCow<'a>>,
 ) -> annotate_snippets::Group<'a> {
     annotate_snippets::Level::ERROR
@@ -24,6 +28,30 @@ fn new_parse_error<'a>(
                     .label(annotation_label),
             ),
         )
+}
+
+fn new_parse_error_expected<'a>(
+    code: &CodeIter<'a>,
+    primary_title: impl Into<Cow<'a, str>>,
+    expected: impl Into<Cow<'a, str>>,
+    annotation_span: &impl Spanned,
+    annotation_label: impl Into<annotate_snippets::OptionCow<'a>>,
+) -> annotate_snippets::Group<'a> {
+    let annotation_span = annotation_span.span();
+    annotate_snippets::Level::ERROR
+        .primary_title(primary_title)
+        .element(
+            code.source().snippet().annotation(
+                annotate_snippets::AnnotationKind::Primary
+                    .span(annotation_span.to_range())
+                    .label(annotation_label),
+            ),
+        )
+        .element(annotate_snippets::Level::HELP.message("try applying the following change"))
+        .element(code.source().snippet().patch(annotate_snippets::Patch::new(
+            annotation_span.to_range(),
+            expected,
+        )))
 }
 
 fn eat_whitespace<'a>(code: &mut CodeIter<'a>, errors: Option<&mut Vec<ParseError<'a>>>) -> Span {
@@ -42,8 +70,8 @@ fn eat_whitespace<'a>(code: &mut CodeIter<'a>, errors: Option<&mut Vec<ParseErro
         if code.speculate(|code| code.next_char() == Some('\r') && code.peek() != Some('\n')) {
             errors.push(new_parse_error(
                 code,
-                "naked carridge returns aren't supported",
-                special_start.up_to(code),
+                "naked carriage returns aren't supported",
+                &special_start.up_to(code),
                 "here",
             ));
             continue;
@@ -54,7 +82,7 @@ fn eat_whitespace<'a>(code: &mut CodeIter<'a>, errors: Option<&mut Vec<ParseErro
             errors.push(new_parse_error(
                 code,
                 "unsupported whitespace (only a plain space, ' ', is allowed)",
-                special_start.up_to(code),
+                &special_start.up_to(code),
                 "here",
             ));
             continue;
@@ -110,14 +138,21 @@ fn parse_varname<'a>(code: &mut CodeIter<'a>, simple: bool) -> Option<Varname<'a
 }
 
 #[derive(Debug)]
-enum EvalStringPiece<'a> {
+enum EvalStringPieceData<'a> {
     Literal(&'a str),
     Var(Varname<'a>),
+    QuoteVar(Varname<'a>),
+    Func(EvalString<'a>),
+    QuoteFunc(EvalString<'a>),
 }
 
-impl fmt::Display for EvalStringPiece<'_> {
+impl fmt::Display for EvalStringPieceData<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // $"(run $python script.py)"
         match self {
+            Self::Literal("$") => f.write_str("$$"),
+            Self::Literal("|") => f.write_str("$|"),
+            Self::Literal(":") => f.write_str("$:"),
             Self::Literal(lit) => f.write_str(lit),
             Self::Var(var) => {
                 f.write_str("${")?;
@@ -125,7 +160,64 @@ impl fmt::Display for EvalStringPiece<'_> {
                 f.write_str("}")?;
                 Ok(())
             }
+            Self::QuoteVar(var) => {
+                f.write_str("$\"")?;
+                fmt::Display::fmt(var, f)?;
+                f.write_str("\"")?;
+                Ok(())
+            }
+            Self::Func(func) => {
+                f.write_str("$(")?;
+                fmt::Display::fmt(func, f)?;
+                f.write_str(")")?;
+                Ok(())
+            }
+            Self::QuoteFunc(func) => {
+                f.write_str("$\"(")?;
+                fmt::Display::fmt(func, f)?;
+                f.write_str(")\"")?;
+                Ok(())
+            }
         }
+    }
+}
+
+#[derive(Debug)]
+struct EvalStringPiece<'a> {
+    span: Span,
+    data: EvalStringPieceData<'a>,
+}
+
+impl<'a> EvalStringPiece<'a> {
+    #[must_use]
+    const fn new(span: Span, data: EvalStringPieceData<'a>) -> Self {
+        Self { span, data }
+    }
+    #[must_use]
+    const fn lit(span: Span, lit: &'a str) -> Self {
+        Self::new(span, EvalStringPieceData::Literal(lit))
+    }
+
+    #[must_use]
+    const fn var(span: Span, var: Varname<'a>) -> Self {
+        Self::new(span, EvalStringPieceData::Var(var))
+    }
+
+    #[must_use]
+    const fn func(span: Span, args: EvalString<'a>) -> Self {
+        Self::new(span, EvalStringPieceData::Func(args))
+    }
+}
+
+impl Spanned for EvalStringPiece<'_> {
+    fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl fmt::Display for EvalStringPiece<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.data, f)
     }
 }
 
@@ -133,6 +225,12 @@ impl fmt::Display for EvalStringPiece<'_> {
 struct EvalString<'a> {
     span: Span,
     pieces: Vec<EvalStringPiece<'a>>,
+}
+
+impl Spanned for EvalString<'_> {
+    fn span(&self) -> Span {
+        self.span
+    }
 }
 
 impl fmt::Display for EvalString<'_> {
@@ -144,91 +242,330 @@ impl fmt::Display for EvalString<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalStrNewline {
+    Ignore,
+    Stop,
+    Consume,
+}
+
 fn parse_eval_str<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
-    path: bool,
+    stop_chars: &[char],
+    newline_handling: EvalStrNewline,
+    quote_aware: bool,
 ) -> EvalString<'a> {
     let start = code.pos();
 
     let mut pieces = vec![];
+    let mut quote_mode = QuoteMode::Unquoted;
+    let mut backslash_escape = false;
+    let mut ws = true;
+
     loop {
-        let (_, lit) = code.take_char_while(|ch| {
-            !matches!(ch, '\r' | '\n' | '$') && !(path && matches!(ch, ' ' | ':' | '|'))
+        let (lit_span, lit) = code.take_char_while(|ch| {
+            if matches!(ch, '\r' | '\n' | '$') {
+                return false;
+            }
+            if !quote_aware {
+                return !stop_chars.contains(&ch);
+            }
+
+            let prev_ws = ws;
+            ws = false;
+
+            if backslash_escape {
+                backslash_escape = false;
+                return true;
+            }
+
+            match (quote_mode, ch) {
+                (QuoteMode::Unquoted, ch) if stop_chars.contains(&ch) => return false,
+                (QuoteMode::Unquoted, ' ' | '\t' | '\n') => {
+                    ws = true;
+                }
+                (QuoteMode::Unquoted, '\\') => {
+                    backslash_escape = true;
+                    ws = prev_ws;
+                }
+                (QuoteMode::Unquoted, '\'') => quote_mode = QuoteMode::SingleQuoted,
+                (QuoteMode::Unquoted, '"') => quote_mode = QuoteMode::DoubleQuoted,
+                (QuoteMode::SingleQuoted, '\'') => quote_mode = QuoteMode::Unquoted,
+                (QuoteMode::DoubleQuoted, '\\') => {
+                    backslash_escape = true;
+                }
+                (QuoteMode::DoubleQuoted, '"') => quote_mode = QuoteMode::Unquoted,
+                _ => {}
+            }
+            true
         });
+
+        let prev_backslash_escape = backslash_escape;
+        backslash_escape = false;
+        let prev_ws = ws;
+        ws = false;
+
         if !lit.is_empty() {
-            pieces.push(EvalStringPiece::Literal(lit))
+            pieces.push(EvalStringPiece::lit(lit_span, lit))
         }
+
+        let mut dollar_escape = false;
 
         let piece_start = code.clone();
         if code.take_newline() {
-            if path {
-                *code = piece_start;
+            ws = prev_ws || !prev_backslash_escape;
+            match newline_handling {
+                EvalStrNewline::Ignore => {
+                    pieces.push(EvalStringPiece::lit(piece_start.up_to(code), "\n"))
+                }
+                EvalStrNewline::Stop => {
+                    *code = piece_start;
+                    break;
+                }
+                EvalStrNewline::Consume => break,
+            }
+        } else if code.peek().is_some_and(|ch| stop_chars.contains(&ch)) {
+            break;
+        } else if code.take_char_matches('\r') {
+            errors.push(new_parse_error(
+                code,
+                "naked carriage returns aren't supported",
+                &*code,
+                "here",
+            ));
+        } else if code.is_empty() {
+            if matches!(newline_handling, EvalStrNewline::Consume) {
+                errors.push(new_parse_error(code, "unexpected EOF", &*code, "here"));
             }
             break;
-        } else if path && matches!(code.peek(), Some(' ' | ':' | '|')) {
-            break;
         } else if code.take_char_matches('$') {
-            if code.take_char_matches('$') {
-                pieces.push(EvalStringPiece::Literal("$"));
-            } else if code.take_char_matches(' ') {
-                pieces.push(EvalStringPiece::Literal(" "));
-            } else if code.take_newline() {
-                code.take_char_while(|ch| ch == ' ');
-            } else if code.take_char_matches('{') {
+            dollar_escape = true
+        } else {
+            unreachable!();
+        }
+
+        if !dollar_escape {
+            continue;
+        }
+
+        let mut expansion_escape = false;
+
+        let escapee_start = code.pos();
+        if code.take_char_matches('$') {
+            pieces.push(EvalStringPiece::lit(piece_start.up_to(code), "$"));
+        } else if code.take_char_matches(':') {
+            pieces.push(EvalStringPiece::lit(piece_start.up_to(code), ":"));
+        } else if code.take_char_matches(' ') {
+            ws = !prev_backslash_escape;
+            pieces.push(EvalStringPiece::lit(piece_start.up_to(code), " "));
+        } else if code.take_char_matches('^') {
+            // Starting with the yet unreleased, ninja 1.14
+            ws |= !prev_backslash_escape;
+            pieces.push(EvalStringPiece::lit(piece_start.up_to(code), "\n"));
+        } else if code.take_newline() {
+            backslash_escape = prev_backslash_escape;
+            code.take_char_while(|ch| ch == ' ');
+        } else if let Some(quote_ch) = code.take_char_if(|ch| matches!(ch, '"' | '\'')) {
+            // MEX extension
+            let opening_quote_span = escapee_start.up_to(code);
+
+            if prev_backslash_escape {
+                errors.push(new_parse_error_expected(
+                    code,
+                    "quoted values cannot be preceded by backslashes",
+                    "\\",
+                    &piece_start.span().start(),
+                    "here",
+                ));
+            }
+
+            let mut eat_closing_quote = true;
+            let data = if code.take_char_matches('(') {
+                let func_str = parse_eval_str(code, errors, &[')'], EvalStrNewline::Ignore, true);
+                if !code.take_char_matches(')') {
+                    eat_closing_quote = false;
+                    errors.push(new_parse_error_expected(
+                        code,
+                        "expected closing parenthesis ')'",
+                        ")",
+                        &*code,
+                        "here",
+                    ));
+                }
+                EvalStringPieceData::QuoteFunc(func_str)
+            } else {
                 let name = parse_varname(code, false).unwrap_or_else(|| {
-                    errors.push(new_parse_error(
+                    errors.push(new_parse_error_expected(
                         code,
                         "expected a variable name",
+                        "<variable_name>",
                         &*code,
                         "here",
                     ));
                     Varname::new_invalid_at(code)
                 });
-                pieces.push(EvalStringPiece::Var(name));
-                if !code.take_char_matches('}') {
-                    errors.push(new_parse_error(
-                        code,
-                        "expected a closing curly brace '}'",
-                        &*code,
-                        "here",
-                    ));
-                }
-            } else if code.take_char_matches(':') {
-                pieces.push(EvalStringPiece::Literal(":"));
-            } else if code.take_char_matches('^') {
-                // Starting with the yet unreleased, ninja 1.14
-                pieces.push(EvalStringPiece::Literal("\n"));
-            } else if let Some(name) = parse_varname(code, true) {
-                pieces.push(EvalStringPiece::Var(name));
-            } else {
-                pieces.push(EvalStringPiece::Literal("$"));
-                errors.push(new_parse_error(
+                EvalStringPieceData::QuoteVar(name)
+            };
+
+            let closing_quote_start = code.pos();
+            if eat_closing_quote && !code.take_char_matches(quote_ch) {
+                errors.push(new_parse_error_expected(
                     code,
-                    "bad $-escape (literal $ must be written as $$)",
-                    piece_start.up_to(code),
+                    "expected a closing double quote (\")",
+                    "\"",
+                    &*code,
                     "here",
                 ));
             }
-        } else if code.take_char_matches('\r') {
-            errors.push(new_parse_error(
+            let closing_quote_span = closing_quote_start.up_to(code);
+
+            pieces.push(EvalStringPiece::new(piece_start.up_to(code), data));
+
+            if eat_closing_quote && quote_ch != '\"' {
+                errors.push(
+                    annotate_snippets::Level::ERROR
+                        .primary_title("quoted variables and functions must use double quotes (\")")
+                        .element(
+                            code.source()
+                                .snippet()
+                                .annotation(
+                                    annotate_snippets::AnnotationKind::Primary
+                                        .span(opening_quote_span.to_range())
+                                        .label("here"),
+                                )
+                                .annotation(
+                                    annotate_snippets::AnnotationKind::Primary
+                                        .span(closing_quote_span.to_range())
+                                        .label("and here"),
+                                ),
+                        )
+                        .element(
+                            annotate_snippets::Level::HELP
+                                .message("try applying the following change"),
+                        )
+                        .element(code.source().snippet().patches([
+                            annotate_snippets::Patch::new(opening_quote_span.to_range(), "\""),
+                            annotate_snippets::Patch::new(closing_quote_span.to_range(), "\""),
+                        ])),
+                );
+            }
+
+            if quote_mode != QuoteMode::Unquoted {
+                errors.push(new_parse_error(
+                    code,
+                    "cannot nest quoted expressions inside other quotes",
+                    &piece_start.up_to(code),
+                    "this expression is quoted",
+                ));
+            }
+        } else {
+            expansion_escape = true;
+        }
+
+        if !expansion_escape {
+            continue;
+        }
+
+        if quote_aware && !prev_ws {
+            errors.push(new_parse_error_expected(
                 code,
-                "naked carridge returns aren't supported",
-                &*code,
+                "an expansion must be preceded by whitespace",
+                match prev_backslash_escape {
+                    true => "\\ ",
+                    false => " ",
+                },
+                &piece_start,
                 "here",
             ));
-        } else if code.is_empty() {
-            if !path {
-                errors.push(new_parse_error(code, "unexpected EOF", &*code, "here"));
+        }
+
+        if code.take_char_matches('{') {
+            let name = parse_varname(code, false).unwrap_or_else(|| {
+                errors.push(new_parse_error_expected(
+                    code,
+                    "expected a variable name",
+                    "<variable_name>",
+                    &*code,
+                    "here",
+                ));
+                Varname::new_invalid_at(code)
+            });
+            pieces.push(EvalStringPiece::var(piece_start.up_to(code), name));
+            if !code.take_char_matches('}') {
+                errors.push(new_parse_error_expected(
+                    code,
+                    "expected a closing curly brace '}'",
+                    "}",
+                    &*code,
+                    "here",
+                ));
             }
-            break;
+        } else if code.take_char_matches('(') {
+            // MEX extension
+            let func_str = parse_eval_str(code, errors, &[')'], EvalStrNewline::Ignore, true);
+            pieces.push(EvalStringPiece::func(piece_start.up_to(code), func_str));
+            if !code.take_char_matches(')') {
+                errors.push(new_parse_error_expected(
+                    code,
+                    "expected closing parenthesis ')'",
+                    ")",
+                    &*code,
+                    "here",
+                ));
+            }
+        } else if let Some(name) = parse_varname(code, true) {
+            pieces.push(EvalStringPiece::var(piece_start.up_to(code), name));
         } else {
-            unreachable!();
+            pieces.push(EvalStringPiece::lit(piece_start.up_to(code), "$"));
+            errors.push(new_parse_error(
+                code,
+                "bad $-escape (literal $ must be written as $$)",
+                &piece_start.up_to(code),
+                "here",
+            ));
+            continue;
+        }
+
+        if quote_aware && quote_mode != QuoteMode::Unquoted {
+            errors.push(
+                new_parse_error(
+                    code,
+                    "cannot expand inside quotes",
+                    pieces.last().unwrap(),
+                    "here",
+                )
+                .element(
+                    annotate_snippets::Level::HELP
+                        .message("the variable may contain quotes which will corrupt quoting"),
+                ),
+            );
         }
     }
 
-    if path {
-        eat_whitespace(code, Some(errors));
+    // Check for quote & whitespace integrity
+    for [piece, next_piece] in pieces.array_windows() {
+        use EvalStringPieceData as Data;
+
+        if !quote_aware || !matches!(piece.data, Data::Var(_) | Data::Func(_)) {
+            continue;
+        }
+
+        let forward_err = match next_piece.data {
+            Data::Literal(lit) => !lit.starts_with(&[' ', '\t', '\n']),
+            Data::Func(_) | Data::Var(_) => false,
+            _ => true,
+        };
+
+        if forward_err {
+            errors.push(new_parse_error_expected(
+                code,
+                "an expansion must be followed by whitespace",
+                " ",
+                &piece.span().end(),
+                "after this",
+            ));
+        }
     }
 
     EvalString {
@@ -245,7 +582,8 @@ fn parse_paths<'a>(
     eat_whitespace(code, Some(errors));
     let start = code.clone();
     loop {
-        let path = parse_eval_str(code, errors, true);
+        let path = parse_eval_str(code, errors, &[' ', ':', '|'], EvalStrNewline::Stop, false);
+        eat_whitespace(code, Some(errors));
         if path.pieces.is_empty() {
             break;
         }
@@ -264,6 +602,12 @@ struct Comment<'a> {
     post_newlines: u32,
 }
 
+impl Spanned for Comment<'_> {
+    fn span(&self) -> Span {
+        self.text_span
+    }
+}
+
 impl fmt::Display for Comment<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.text)?;
@@ -276,6 +620,7 @@ impl fmt::Display for Comment<'_> {
 
 #[derive(Debug)]
 struct Filler<'a> {
+    span: Span,
     start_newlines: u32,
     comments: Vec<Comment<'a>>,
 }
@@ -293,11 +638,6 @@ impl fmt::Display for Filler<'_> {
 }
 
 impl Filler<'_> {
-    const EMPTY: Self = Self {
-        start_newlines: 0,
-        comments: vec![],
-    };
-
     #[inline]
     #[must_use]
     fn is_empty(&self) -> bool {
@@ -306,6 +646,8 @@ impl Filler<'_> {
 }
 
 fn parse_filler<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> Filler<'a> {
+    let start = code.pos();
+
     let mut start_newlines = 0;
     let mut comments = vec![];
     loop {
@@ -320,7 +662,13 @@ fn parse_filler<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -
             *code = peek;
             if !code.take_newline() {
                 assert!(code.is_empty());
-                errors.push(new_parse_error(code, "expected newline", &*code, "here"));
+                errors.push(new_parse_error_expected(
+                    code,
+                    "expected newline",
+                    "\n",
+                    &*code,
+                    "here",
+                ));
             }
             comments.push(Comment {
                 text,
@@ -335,6 +683,7 @@ fn parse_filler<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -
             }
         } else {
             break Filler {
+                span: start.up_to(code),
                 start_newlines,
                 comments,
             };
@@ -351,7 +700,9 @@ struct LetStmt<'a> {
 impl fmt::Display for LetStmt<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.var, f)?;
-        f.write_str(" = ")?;
+        if !matches!(self.var.name, "@" | "!") {
+            f.write_str(" = ")?;
+        }
         fmt::Display::fmt(&self.value, f)?;
         f.write_str("\n")?;
         Ok(())
@@ -360,25 +711,29 @@ impl fmt::Display for LetStmt<'_> {
 
 fn parse_let<'a>(code: &mut CodeIter<'a>, errors: &mut Vec<ParseError<'a>>) -> LetStmt<'a> {
     let var = parse_varname(code, false).unwrap_or_else(|| {
-        errors.push(new_parse_error(
+        errors.push(new_parse_error_expected(
             code,
             "expected a variable name",
+            "<variable_name> = ",
             &*code,
             "here",
         ));
         Varname::new_invalid_at(code)
     });
     eat_whitespace(code, Some(errors));
-    if !code.take_char_matches('=') {
-        errors.push(new_parse_error(
-            code,
-            "expected assignment operator '='",
-            &*code,
-            "here",
-        ));
+    if var.is_valid() {
+        if !code.take_char_matches('=') {
+            errors.push(new_parse_error_expected(
+                code,
+                "expected assignment operator '='",
+                "= ",
+                &*code,
+                "here",
+            ));
+        }
+        eat_whitespace(code, None);
     }
-    eat_whitespace(code, None);
-    let value = parse_eval_str(code, errors, false);
+    let value = parse_eval_str(code, errors, &[], EvalStrNewline::Consume, false);
 
     LetStmt { var, value }
 }
@@ -440,9 +795,10 @@ fn parse_rule<'a>(
 ) -> (RuleStmt<'a>, Filler<'a>) {
     eat_whitespace(code, Some(errors));
     let name = parse_varname(code, false).unwrap_or_else(|| {
-        errors.push(new_parse_error(
+        errors.push(new_parse_error_expected(
             code,
             "expected a rule name",
+            " <rule_name>",
             &*code,
             "here",
         ));
@@ -450,7 +806,13 @@ fn parse_rule<'a>(
     });
     eat_whitespace(code, Some(errors));
     if !code.take_newline() {
-        errors.push(new_parse_error(code, "expected newline", &*code, "here"));
+        errors.push(new_parse_error_expected(
+            code,
+            "expected newline",
+            "\n",
+            &*code,
+            "here",
+        ));
         code.take_char_while(|ch| ch != '\n');
         code.take_newline();
     }
@@ -464,32 +826,47 @@ fn parse_rule<'a>(
             break filler;
         }
 
-        let let_stmt = parse_let(code, errors);
-        if !is_reserved_binding(&let_stmt.var.name) && let_stmt.var.is_valid() {
-            errors.push(
-                annotate_snippets::Level::ERROR
-                    .primary_title(format!("unexpected variable '{}'", let_stmt.var))
-                    .element(
-                        code.source().snippet().annotations([
-                            annotate_snippets::AnnotationKind::Context
-                                .span(rule_span.join(name.span()).to_range())
-                                .label("while parsing"),
-                            annotate_snippets::AnnotationKind::Primary
-                                .span(let_stmt.var.span().to_range())
-                                .label("here"),
-                        ]),
-                    )
-                    .element(
-                        annotate_snippets::Level::INFO
-                            .message("rules may only bind certain variables"),
-                    ),
-            );
+        let name_start = code.clone();
+        if code.take_char_if(|ch| matches!(ch, '@' | '!')).is_some() {
+            // MEX extension
+            let var = Varname {
+                span: name_start.up_to(code),
+                name: name_start.as_str_until(code.pos()),
+            };
+            let value = parse_eval_str(code, errors, &[], EvalStrNewline::Consume, false);
+            let binding = Binding {
+                indent_span,
+                let_stmt: LetStmt { var, value },
+            };
+            bindings.push((filler, binding))
+        } else {
+            let let_stmt = parse_let(code, errors);
+            if !is_reserved_binding(&let_stmt.var.name) && let_stmt.var.is_valid() {
+                errors.push(
+                    annotate_snippets::Level::ERROR
+                        .primary_title(format!("unexpected variable '{}'", let_stmt.var))
+                        .element(
+                            code.source().snippet().annotations([
+                                annotate_snippets::AnnotationKind::Context
+                                    .span(rule_span.join(name.span()).to_range())
+                                    .label("while parsing"),
+                                annotate_snippets::AnnotationKind::Primary
+                                    .span(let_stmt.var.span().to_range())
+                                    .label("here"),
+                            ]),
+                        )
+                        .element(
+                            annotate_snippets::Level::INFO
+                                .message("rules may only bind certain variables"),
+                        ),
+                );
+            }
+            let binding = Binding {
+                indent_span,
+                let_stmt,
+            };
+            bindings.push((filler, binding));
         }
-        let binding = Binding {
-            indent_span,
-            let_stmt,
-        };
-        bindings.push((filler, binding));
     };
 
     let rule_stmt = RuleStmt {
@@ -575,21 +952,29 @@ fn parse_build<'a>(
         false => vec![],
     };
     if outs.is_empty() && implicit_outs.is_empty() {
-        errors.push(new_parse_error(
+        errors.push(new_parse_error_expected(
             code,
             "expected output path",
+            "<output-path>",
             &*code,
             "here",
         ));
     }
     if !code.take_char_matches(':') {
-        errors.push(new_parse_error(code, "expected colon", &*code, "here"));
+        errors.push(new_parse_error_expected(
+            code,
+            "expected colon",
+            ":",
+            &*code,
+            "here",
+        ));
     }
     eat_whitespace(code, Some(errors));
     let rule = parse_varname(code, false).unwrap_or_else(|| {
-        errors.push(new_parse_error(
+        errors.push(new_parse_error_expected(
             code,
             "expected a rule name",
+            "<rule_name>",
             &*code,
             "here",
         ));
@@ -611,8 +996,8 @@ fn parse_build<'a>(
     if !code.take_newline() {
         let mut peek = code.clone();
         errors.push(match peek.next_char() {
-            Some(':') => new_parse_error(code, "unexpected colon", code.up_to(&peek), "here"),
-            _ => new_parse_error(code, "expected newline", &*code, "here"),
+            Some(':') => new_parse_error(code, "unexpected colon", &code.up_to(&peek), "here"),
+            _ => new_parse_error_expected(code, "expected newline", "\n", &*code, "here"),
         });
 
         code.take_char_while(|ch| ch != '\n');
@@ -679,9 +1064,9 @@ fn parse_default<'a>(
     if !code.take_newline() {
         let mut peek = code.clone();
         errors.push(match peek.next_char() {
-            Some(':') => new_parse_error(code, "unexpected colon", code.up_to(&peek), "here"),
-            Some('|') => new_parse_error(code, "unexpected pipe", code.up_to(&peek), "here"),
-            _ => new_parse_error(code, "expected newline", &*code, "here"),
+            Some(':') => new_parse_error(code, "unexpected colon", &code.up_to(&peek), "here"),
+            Some('|') => new_parse_error(code, "unexpected pipe", &code.up_to(&peek), "here"),
+            _ => new_parse_error_expected(code, "expected newline", "\n", &*code, "here"),
         });
 
         code.take_char_while(|ch| ch != '\n');
@@ -718,9 +1103,10 @@ fn parse_pool<'a>(
 ) -> (PoolStmt<'a>, Filler<'a>) {
     eat_whitespace(code, Some(errors));
     let name = parse_varname(code, false).unwrap_or_else(|| {
-        errors.push(new_parse_error(
+        errors.push(new_parse_error_expected(
             code,
             "expected a pool name",
+            "<pool_name>",
             &*code,
             "here",
         ));
@@ -728,7 +1114,13 @@ fn parse_pool<'a>(
     });
     eat_whitespace(code, Some(errors));
     if !code.take_newline() {
-        errors.push(new_parse_error(code, "expected newline", &*code, "here"));
+        errors.push(new_parse_error_expected(
+            code,
+            "expected newline",
+            "\n",
+            &*code,
+            "here",
+        ));
 
         code.take_char_while(|ch| ch != '\n');
         code.take_newline();
@@ -792,7 +1184,12 @@ fn parse_pool<'a>(
                 .element(
                     annotate_snippets::Level::INFO
                         .message("pools require a 'depth' variable binding"),
-                ),
+                )
+                .element(annotate_snippets::Level::HELP.message("try the following change"))
+                .element(code.source().snippet().patch(annotate_snippets::Patch::new(
+                    filler.span.start().span().to_range(),
+                    "\n    depth = <number>",
+                ))),
         );
     }
 
@@ -832,34 +1229,32 @@ fn parse_item<'a>(
     code: &mut CodeIter<'a>,
     errors: &mut Vec<ParseError<'a>>,
 ) -> (Item<'a>, Filler<'a>) {
-    loop {
-        let indent_span = eat_whitespace(code, Some(errors));
+    let indent_span = eat_whitespace(code, Some(errors));
 
-        if !indent_span.is_empty() {
-            errors.push(new_parse_error(
-                code,
-                "unexpected indent",
-                indent_span,
-                "here",
-            ));
-        }
+    if !indent_span.is_empty() {
+        errors.push(new_parse_error(
+            code,
+            "unexpected indent",
+            &indent_span,
+            "here",
+        ));
+    }
 
-        if let Some(rule_span) = code.take_str_matches("rule") {
-            let (rule_stmt, filler) = parse_rule(code, errors, rule_span);
-            break (Item::Rule(rule_stmt), filler);
-        } else if let Some(build_span) = code.take_str_matches("build") {
-            let (build_stmt, filler) = parse_build(code, errors, build_span);
-            break (Item::Build(build_stmt), filler);
-        } else if let Some(default_stmt) = code.take_str_matches("default") {
-            let default_stmt = parse_default(code, errors, default_stmt);
-            break (Item::Default(default_stmt), parse_filler(code, errors));
-        } else if let Some(pool_span) = code.take_str_matches("pool") {
-            let (pool_stmt, filler) = parse_pool(code, errors, pool_span);
-            break (Item::Pool(pool_stmt), filler);
-        } else {
-            let let_stmt = parse_let(code, errors);
-            break (Item::Let(let_stmt), parse_filler(code, errors));
-        }
+    if let Some(rule_span) = code.take_str_matches("rule") {
+        let (rule_stmt, filler) = parse_rule(code, errors, rule_span);
+        (Item::Rule(rule_stmt), filler)
+    } else if let Some(build_span) = code.take_str_matches("build") {
+        let (build_stmt, filler) = parse_build(code, errors, build_span);
+        (Item::Build(build_stmt), filler)
+    } else if let Some(default_stmt) = code.take_str_matches("default") {
+        let default_stmt = parse_default(code, errors, default_stmt);
+        (Item::Default(default_stmt), parse_filler(code, errors))
+    } else if let Some(pool_span) = code.take_str_matches("pool") {
+        let (pool_stmt, filler) = parse_pool(code, errors, pool_span);
+        (Item::Pool(pool_stmt), filler)
+    } else {
+        let let_stmt = parse_let(code, errors);
+        (Item::Let(let_stmt), parse_filler(code, errors))
     }
 }
 
@@ -916,12 +1311,12 @@ fn main() -> anyhow::Result<()> {
 
     let file = args.file.unwrap_or_else(|| "build.mex".into());
 
+    // TODO: improve UTF-8 & \0 error handling
     let source = Source {
         code: fs::read_to_string(&file)?,
         path: file,
     };
 
-    // TODO: improve UTF-8 & \0 error handling
     if source.code.contains('\0') {
         bail!(
             "Null bytes are not supported (file: {})",
